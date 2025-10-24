@@ -95,11 +95,11 @@ class MultiheadAttentionBlock(nn.Module):
             """
             mask == 0: Create boolean mask have same size of mask (True if value = 0, False if value != 0)
             mask_fill_: in_place method (have _ at the end) -> change directly Tensor; 
-                        Replace all True positions in the boolean mask with the value -1e9
-            -1e9: Since softmax(-1e9) ≈ 0
+                        Replace all True positions in the boolean mask with the most negative value 
             """
-            attention_scores.masked_fill_(mask == 0, -1e9)
-
+            fill_value = torch.finfo(attention_scores.dtype).min
+            attention_scores.masked_fill_(mask == 0, fill_value)
+            
         attention_scores = attention_scores.softmax(dim = -1) # (batch, h, seq_len, seq_len)
 
         if dropout is not None:
