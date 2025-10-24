@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import GradScaler, autocast
 import torchmetrics
 
 from dataset import BilingualDataset, causal_mask
@@ -50,6 +51,71 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
 
     return decoder_input.squeeze(0)
 
+def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size=5):
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+
+    # Precompute the encoder output and reuse it for every beam
+    encoder_output = model.encode(source, source_mask)
+
+    # Initialize the beam with the start-of-sentence token
+    # A beam is a list of tuples: (sequence, log_probability)
+    beams = [(torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device), 0.0)]
+
+    # Use a list to store completed hypotheses
+    completed_hypotheses = []
+
+    for _ in range(max_len):
+        new_beams = []
+        for seq, score in beams:
+            # If the last token is EOS, this hypothesis is finished
+            if seq[0, -1].item() == eos_idx:
+                # Add to completed list and continue to the next hypothesis
+                completed_hypotheses.append((seq, score))
+                # Prune this beam
+                beam_size -= 1 
+                continue
+
+            # Get the last token of the current sequence
+            decoder_input = seq
+            # Build the decoder mask
+            decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+
+            # Calculate the output of the decoder
+            out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+
+            # Get the log probabilities for the next token
+            log_probs = model.project(out[:, -1]) # Use log_softmax from the model
+
+            # Get the top k probabilities and their corresponding token indices
+            topk_log_probs, topk_indices = torch.topk(log_probs, beam_size, dim=1)
+
+            # Create new hypotheses by extending the current one
+            for i in range(beam_size):
+                next_word_idx = topk_indices[0, i].item()
+                log_prob = topk_log_probs[0, i].item()
+
+                new_seq = torch.cat(
+                    [seq, torch.empty(1, 1).type_as(source).fill_(next_word_idx).to(device)], dim=1
+                )
+                new_beams.append((new_seq, score + log_prob))
+
+        # If all beams have ended in EOS
+        if not new_beams:
+            break
+
+        # Sort the new beams by their score (log probability)
+        # We want the highest log probability, so we sort in descending order
+        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
+
+    # If no hypotheses were completed, fall back to the current best beam
+    if not completed_hypotheses:
+        completed_hypotheses = beams
+
+    # Normalize scores by sequence length and select the best one
+    best_hypothesis = max(completed_hypotheses, key=lambda x: x[1] / x[0].size(1))
+    
+    return best_hypothesis[0].squeeze(0)
 
 def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                    device, print_msg, global_step, writer, num_examples=2):
@@ -71,7 +137,8 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len,
 
             assert encoder_input.size(0) == 1, "Batch size must be 1 for validation"
 
-            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+            # model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+            model_out = beam_search_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size=5)
 
             source_text = batch['src_text'][0]
             target_text = batch['tgt_text'][0]
@@ -180,6 +247,10 @@ def train_model(config):
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
 
+    if torch.__version__.startswith("2."):
+        print("Compiling the model with torch.compile...")
+        model = torch.compile(model)
+    
     # Tensorboard
     writer = SummaryWriter(config['experiment_name'])
 
@@ -196,7 +267,8 @@ def train_model(config):
         global_step = state['global_step']
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
-
+    
+    scaler = GradScaler()
     for epoch in range(initial_epoch, config['num_epochs']):
         model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing epoch {epoch:02d}")
@@ -207,15 +279,18 @@ def train_model(config):
             encoder_mask = batch['encoder_mask'].to(device) # (b, 1, 1, seq_len)
             decoder_mask = batch['decoder_mask'].to(device) # (b, 1, seq_len, seq_len)
 
-            # Run the tensors through the transformer
-            encoder_output = model.encode(encoder_input, encoder_mask) # (b, seq_len, d_model)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (b, seq_len, d_model)
-            proj_output = model.project(decoder_output) # (b, seq_len, tgt_vocab_size)
+            use_amp = device.type == 'cuda'
+            with autocast(device_type=device.type, enabled=use_amp):
+                # Run the tensors through the transformer
+                encoder_output = model.encode(encoder_input, encoder_mask) # (b, seq_len, d_model)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (b, seq_len, d_model)
+                proj_output = model.project(decoder_output) # (b, seq_len, tgt_vocab_size)
 
-            label = batch['label'].to(device) # (b, seq_len)
+                label = batch['label'].to(device) # (b, seq_len)
 
-            # (b, seq_len, tgt_vocab_size) --> (b * seq_len, tgt_vocab_size)
-            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+                # (b, seq_len, tgt_vocab_size) --> (b * seq_len, tgt_vocab_size)
+                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1).long())
+                
             batch_iterator.set_postfix({f"loss": f"{loss.item():6.3f}"})
 
             # Log the loss
@@ -223,11 +298,13 @@ def train_model(config):
             writer.flush()
 
             # Backpropagate the loss
-            loss.backward()
+            scaler.scale(loss).backward()
 
             # Update the weights
-            optimizer.step()
-            optimizer.zero_grad()
+            scaler.step(optimizer)
+            scaler.update()
+
+            optimizer.zero_grad(set_to_none=True)
 
             global_step += 1 
 
