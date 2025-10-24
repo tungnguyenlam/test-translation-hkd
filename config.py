@@ -3,8 +3,8 @@ from pathlib import Path
 def get_config():
     return {
         "datasource": "opus100",
-        "batch_size": 8,
-        "num_epochs": 20,
+        "batch_size": 128,
+        "num_epochs": 10,
         "lr": 1e-4,
         "seq_len": 80,
         "d_model": 512,
