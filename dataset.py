@@ -14,9 +14,9 @@ class BilingualDataset(Dataset):
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
 
-        self.sos_token = torch.tensor([tokenizer_tgt.token_to_id('[SOS]')], dtype=torch.int64)
-        self.eos_token = torch.tensor([tokenizer_tgt.token_to_id('[EOS]')], dtype=torch.int64)
-        self.pad_token = torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], dtype=torch.int64)
+        self.sos_token = torch.tensor([tokenizer_tgt.token_to_id('[SOS]')], dtype=torch.int32)
+        self.eos_token = torch.tensor([tokenizer_tgt.token_to_id('[EOS]')], dtype=torch.int32)
+        self.pad_token = torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], dtype=torch.int32)
 
     def __len__(self):
         return len(self.ds)
@@ -39,9 +39,9 @@ class BilingualDataset(Dataset):
         encoder_input = torch.cat(
             [
                 self.sos_token,
-                torch.tensor(enc_input_tokens, dtype=torch.int64),
+                torch.tensor(enc_input_tokens, dtype=torch.int32),
                 self.eos_token,
-                torch.tensor([self.pad_token] * enc_num_padding_tokens, dtype=torch.int64)
+                torch.tensor([self.pad_token] * enc_num_padding_tokens, dtype=torch.int32)
             ]
         )
 
@@ -49,17 +49,17 @@ class BilingualDataset(Dataset):
         decoder_input = torch.cat(
             [
                 self.sos_token,
-                torch.tensor(dec_input_tokens, dtype=torch.int64),
-                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64)
+                torch.tensor(dec_input_tokens, dtype=torch.int32),
+                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int32)
             ]
         )
 
         # Add EOS to the label
         label = torch.cat(
             [
-                torch.tensor(dec_input_tokens, dtype=torch.int64),
+                torch.tensor(dec_input_tokens, dtype=torch.int32),
                 self.eos_token,
-                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64)
+                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int32)
             ]
         )
 
